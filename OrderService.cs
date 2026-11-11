@@ -1,0 +1,21 @@
+using System.Data; using ElectronicsStore.Data; using ElectronicsStore.Models; using Microsoft.Data.SqlClient;
+namespace ElectronicsStore.Services;
+public static class OrderService {
+ public static async Task<int> Create(IReadOnlyList<CartLine> lines,int client){Session.RequireLogin();if(lines.Count==0)throw new ArgumentException("Корзина пуста.");if(!Session.Staff)client=Session.Current!.Id;foreach(var l in lines)PriceRules.Total(l.Product.Price,l.Quantity,l.Discount);if(lines.Select(l=>l.Product.Id).Distinct().Count()!=lines.Count)throw new ArgumentException("Товар повторяется в корзине.");
+ await using var c=await Db.Open();using var tx=c.BeginTransaction(IsolationLevel.Serializable);
+ try{
+ using(var check=Db.Command(c,"SELECT COUNT(*) FROM Clients WHERE client_id=@id AND is_active=1",tx,("@id",client))){if(Convert.ToInt32(await check.ExecuteScalarAsync())!=1)throw new ArgumentException("Клиент не найден или отключен.");}
+ using var head=Db.Command(c,"INSERT Orders(client_id,created_by,status,total_amount) OUTPUT INSERTED.order_id VALUES(@c,@u,N'Оформлен',0)",tx,("@c",client),("@u",Session.Current!.Id));var id=Convert.ToInt32(await head.ExecuteScalarAsync());decimal total=0;
+ foreach(var l in lines.OrderBy(x=>x.Product.Id)){
+ using var update=Db.Command(c,"UPDATE Products WITH(UPDLOCK) SET stock_quantity=stock_quantity-@q WHERE product_id=@p AND stock_quantity>=@q AND price=@price",tx,("@q",l.Quantity),("@p",l.Product.Id),("@price",l.Product.Price));if(await update.ExecuteNonQueryAsync()!=1)throw new InvalidOperationException("Недостаточный остаток или цена изменилась. Обновите каталог и корзину.");
+ var sum=PriceRules.Total(l.Product.Price,l.Quantity,l.Discount);total=checked(total+sum);
+ using var item=Db.Command(c,"INSERT OrderItems(order_id,product_id,quantity,price_at_purchase,discount_percent,line_total) VALUES(@o,@p,@q,@price,@d,@s)",tx,("@o",id),("@p",l.Product.Id),("@q",l.Quantity),("@price",l.Product.Price),("@d",l.Discount),("@s",sum));await item.ExecuteNonQueryAsync();}
+ using var finish=Db.Command(c,"UPDATE Orders SET total_amount=@t WHERE order_id=@o",tx,("@t",total),("@o",id));await finish.ExecuteNonQueryAsync();tx.Commit();return id;
+ }catch{tx.Rollback();throw;}}
+ public static Task<DataTable> List(){Session.RequireLogin();return Db.Query("SELECT o.order_id AS Номер,o.order_date AS Дата,c.full_name AS Клиент,o.status AS Статус,o.total_amount AS Сумма FROM Orders o JOIN Clients c ON c.client_id=o.client_id WHERE @staff=1 OR o.client_id=@id ORDER BY o.order_id DESC",("@staff",Session.Staff),("@id",Session.Current!.Id));}
+ public static async Task<DataTable> Details(int id){Session.RequireLogin();return await Db.Query("SELECT p.title AS Товар,i.quantity AS Количество,i.price_at_purchase AS Цена,i.discount_percent AS Скидка,i.line_total AS Сумма FROM OrderItems i JOIN Products p ON p.product_id=i.product_id JOIN Orders o ON o.order_id=i.order_id WHERE o.order_id=@o AND (@staff=1 OR o.client_id=@id)",("@o",id),("@staff",Session.Staff),("@id",Session.Current!.Id));}
+ public static async Task Cancel(int id){Session.RequireManage();await using var c=await Db.Open();using var tx=c.BeginTransaction(IsolationLevel.Serializable);try{
+ using var lockOrder=Db.Command(c,"UPDATE Orders WITH(UPDLOCK) SET status=N'Отменен' WHERE order_id=@id AND status=N'Оформлен'",tx,("@id",id));if(await lockOrder.ExecuteNonQueryAsync()!=1)throw new InvalidOperationException("Заказ уже отменен или не найден.");
+ using var restore=Db.Command(c,"UPDATE p SET stock_quantity=p.stock_quantity+i.quantity FROM Products p JOIN OrderItems i ON i.product_id=p.product_id WHERE i.order_id=@id",tx,("@id",id));await restore.ExecuteNonQueryAsync();tx.Commit();}catch{tx.Rollback();throw;}}
+ public static Task<DataTable> Report(DateTime from,DateTime to){Session.RequireManage();if(to.Date<from.Date)throw new ArgumentException("Конец периода раньше начала.");return Db.Query("SELECT p.title AS Товар,SUM(i.quantity) AS Количество,SUM(i.line_total) AS Выручка FROM OrderItems i JOIN Orders o ON o.order_id=i.order_id JOIN Products p ON p.product_id=i.product_id WHERE o.status=N'Оформлен' AND o.order_date>=@a AND o.order_date<@b GROUP BY p.product_id,p.title ORDER BY Выручка DESC",("@a",from.Date),("@b",to.Date.AddDays(1)));}
+}
